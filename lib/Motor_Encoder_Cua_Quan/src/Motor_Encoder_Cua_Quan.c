@@ -1,180 +1,136 @@
 #include "Motor_Encoder_Cua_Quan.h"
 
-/* ====== GPIO clock enable helper ====== */
-static void gpio_clock_enable(GPIO_TypeDef *g)
+/* LUT quadrature chuẩn: state=(B<<1)|A; idx=(prev<<2)|curr */
+static const int8_t ENC_LUT[16] = {
+     0, -1, +1,  0,
+    +1,  0,  0, -1,
+    -1,  0,  0, +1,
+     0, +1, -1,  0
+};
+
+static inline uint8_t read_pin(GPIO_TypeDef *gpio, uint8_t pin)
 {
-    if (g == GPIOA) RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
-    else if (g == GPIOB) RCC->AHB1ENR |= RCC_AHB1ENR_GPIOBEN;
-    else if (g == GPIOC) RCC->AHB1ENR |= RCC_AHB1ENR_GPIOCEN;
-    else if (g == GPIOD) RCC->AHB1ENR |= RCC_AHB1ENR_GPIODEN;
-    else if (g == GPIOE) RCC->AHB1ENR |= RCC_AHB1ENR_GPIOEEN;
-    (void)RCC->AHB1ENR;
+    return (gpio->IDR & (1U << pin)) ? 1U : 0U;
 }
 
-static void gpio_input(GPIO_TypeDef *g, uint8_t pin)
+static inline uint8_t read_ab(EncoderEXTI_CQ_Handle *h)
 {
-    g->MODER &= ~(3U << (pin * 2U)); /* input */
-    g->PUPDR &= ~(3U << (pin * 2U)); /* nopull (tùy encoder có thể cần pull-up) */
+    uint8_t a = read_pin(h->gpioA, h->pinA);
+    uint8_t b = read_pin(h->gpioB, h->pinB);
+    return (uint8_t)((b << 1) | a);
 }
 
-static void gpio_output_pp(GPIO_TypeDef *g, uint8_t pin)
+static void gpio_input_pullup(GPIO_TypeDef *gpio, uint8_t pin)
 {
-    g->MODER &= ~(3U << (pin * 2U));
-    g->MODER |=  (1U << (pin * 2U)); /* output */
-    g->OTYPER &= ~(1U << pin);       /* push-pull */
-    g->PUPDR  &= ~(3U << (pin * 2U));/* nopull */
+    gpio->MODER &= ~(3U << (pin * 2U));      /* input */
+    gpio->PUPDR &= ~(3U << (pin * 2U));
+    gpio->PUPDR |=  (1U << (pin * 2U));      /* pull-up */
 }
 
-/* ====== EXTI mapping helper (pin -> EXTICR index/shift) ====== */
-static void exti_map_to_port(uint8_t line, uint8_t portcode)
+/* Map EXTI line to port:
+   EXTICR index = line/4, shift = (line%4)*4
+   portcode: A=0, B=1, C=2, D=3, E=4 ...
+*/
+static void exti_map_line_to_port(uint8_t line, uint8_t portcode)
 {
-    /* EXTICR[0] lines 0..3, [1] 4..7, [2] 8..11, [3] 12..15 */
-    uint8_t idx = line / 4U;
-    uint8_t sh  = (line % 4U) * 4U;
+    uint32_t idx = line / 4U;
+    uint32_t sh  = (line % 4U) * 4U;
+
     SYSCFG->EXTICR[idx] &= ~(0xFU << sh);
     SYSCFG->EXTICR[idx] |=  ((uint32_t)portcode << sh);
 }
 
-static uint8_t port_to_code(GPIO_TypeDef *g)
-{
-    if (g == GPIOA) return 0;
-    if (g == GPIOB) return 1;
-    if (g == GPIOC) return 2;
-    if (g == GPIOD) return 3;
-    if (g == GPIOE) return 4;
-    return 0;
-}
-
-/* ====== Quadrature lookup: prev(2-bit) -> now(2-bit) ======
-   Table gives delta in {-1,0,+1}. */
-static const int8_t quad_table[4][4] = {
-    /* now: 00, 01, 10, 11 */
-    /* prev 00 */ {  0, +1, -1,  0 },
-    /* prev 01 */ { -1,  0,  0, +1 },
-    /* prev 10 */ { +1,  0,  0, -1 },
-    /* prev 11 */ {  0, -1, +1,  0 }
-};
-
-static uint8_t read_ab(GPIO_TypeDef *ga, uint8_t pa, GPIO_TypeDef *gb, uint8_t pb)
-{
-    uint8_t a = (uint8_t)((ga->IDR >> pa) & 1U);
-    uint8_t b = (uint8_t)((gb->IDR >> pb) & 1U);
-    return (uint8_t)((a << 1) | b);
-}
-
-/* ===================== ENCODER EXTI ===================== */
 void EncoderEXTI_CQ_Init(EncoderEXTI_CQ_Handle *h)
 {
-    gpio_clock_enable(h->gpioA);
-    gpio_clock_enable(h->gpioB);
+    if (!h || !h->gpioA || !h->gpioB) return;
 
-    gpio_input(h->gpioA, h->pinA);
-    gpio_input(h->gpioB, h->pinB);
+    /* Enable GPIO clocks (AHB1) */
+    if (h->gpioA == GPIOA) RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
+    if (h->gpioA == GPIOB) RCC->AHB1ENR |= RCC_AHB1ENR_GPIOBEN;
+    if (h->gpioA == GPIOC) RCC->AHB1ENR |= RCC_AHB1ENR_GPIOCEN;
+    if (h->gpioA == GPIOD) RCC->AHB1ENR |= RCC_AHB1ENR_GPIODEN;
+    if (h->gpioA == GPIOE) RCC->AHB1ENR |= RCC_AHB1ENR_GPIOEEN;
 
-    /* Enable SYSCFG for EXTI routing */
+    if (h->gpioB == GPIOA) RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
+    if (h->gpioB == GPIOB) RCC->AHB1ENR |= RCC_AHB1ENR_GPIOBEN;
+    if (h->gpioB == GPIOC) RCC->AHB1ENR |= RCC_AHB1ENR_GPIOCEN;
+    if (h->gpioB == GPIOD) RCC->AHB1ENR |= RCC_AHB1ENR_GPIODEN;
+    if (h->gpioB == GPIOE) RCC->AHB1ENR |= RCC_AHB1ENR_GPIOEEN;
+
+    /* SYSCFG for EXTI mapping */
     RCC->APB2ENR |= RCC_APB2ENR_SYSCFGEN;
 
-    uint8_t lineA = h->pinA;
-    uint8_t lineB = h->pinB;
+    gpio_input_pullup(h->gpioA, h->pinA);
+    gpio_input_pullup(h->gpioB, h->pinB);
 
-    exti_map_to_port(lineA, port_to_code(h->gpioA));
-    exti_map_to_port(lineB, port_to_code(h->gpioB));
+    /* Determine portcode from gpio pointer */
+    uint8_t portA = 0, portB = 0;
+    if (h->gpioA == GPIOA) portA = 0;
+    else if (h->gpioA == GPIOB) portA = 1;
+    else if (h->gpioA == GPIOC) portA = 2;
+    else if (h->gpioA == GPIOD) portA = 3;
+    else if (h->gpioA == GPIOE) portA = 4;
 
-    /* Unmask lines */
-    EXTI->IMR |= (1U << lineA) | (1U << lineB);
+    if (h->gpioB == GPIOA) portB = 0;
+    else if (h->gpioB == GPIOB) portB = 1;
+    else if (h->gpioB == GPIOC) portB = 2;
+    else if (h->gpioB == GPIOD) portB = 3;
+    else if (h->gpioB == GPIOE) portB = 4;
 
-    /* Trigger both edges for quadrature */
-    EXTI->RTSR |= (1U << lineA) | (1U << lineB);
-    EXTI->FTSR |= (1U << lineA) | (1U << lineB);
+    /* Map lines */
+    exti_map_line_to_port(h->pinA, portA);
+    exti_map_line_to_port(h->pinB, portB);
+
+    /* Enable EXTI both edges */
+    EXTI->IMR  |= (1U << h->pinA) | (1U << h->pinB);
+    EXTI->RTSR |= (1U << h->pinA) | (1U << h->pinB);
+    EXTI->FTSR |= (1U << h->pinA) | (1U << h->pinB);
 
     /* Clear pending */
-    EXTI->PR = (1U << lineA) | (1U << lineB);
-
-    /* PC7 + PC9 đều thuộc nhóm EXTI9_5 */
-    NVIC_EnableIRQ(EXTI9_5_IRQn);
+    EXTI->PR = (1U << h->pinA) | (1U << h->pinB);
 
     h->count = 0;
-    h->last_ab = read_ab(h->gpioA, h->pinA, h->gpioB, h->pinB);
+    h->prev_ab = read_ab(h);
+
+    /* NOTE: PC7/PC9 nằm trong EXTI9_5_IRQn */
+    NVIC_SetPriority(EXTI9_5_IRQn, 5);
+    NVIC_EnableIRQ(EXTI9_5_IRQn);
 }
 
 void EncoderEXTI_CQ_IRQHandler(EncoderEXTI_CQ_Handle *h)
 {
-    uint32_t maskA = (1U << h->pinA);
-    uint32_t maskB = (1U << h->pinB);
+    if (!h) return;
 
+    uint32_t mask = (1U << h->pinA) | (1U << h->pinB);
     uint32_t pr = EXTI->PR;
 
-    if (pr & (maskA | maskB)) {
-        /* Clear pending first */
-        EXTI->PR = (maskA | maskB);
+    if (pr & mask)
+    {
+        /* clear pending */
+        EXTI->PR = mask;
 
-        uint8_t now = read_ab(h->gpioA, h->pinA, h->gpioB, h->pinB);
-        int8_t d = quad_table[h->last_ab][now];
-        h->count += d;
-        h->last_ab = now;
+        uint8_t curr = read_ab(h);
+        uint8_t idx  = (uint8_t)((h->prev_ab << 2) | curr);
+        int8_t d = ENC_LUT[idx];
+
+        if (d) h->count += d;
+        h->prev_ab = curr;
     }
-}
-
-int16_t EncoderEXTI_CQ_GetDelta(EncoderEXTI_CQ_Handle *h)
-{
-    /* Delta = count since last call => cần biến lưu last_count cục bộ tĩnh theo handle.
-       Cách gọn: dùng static 1 handle/1 encoder. Nếu bạn dùng >1 encoder, mở rộng bằng field last_count. */
-    static int32_t last = 0;
-    int32_t now = h->count;
-    int16_t d = (int16_t)(now - last);
-    last = now;
-    return d;
 }
 
 int32_t EncoderEXTI_CQ_GetCount(EncoderEXTI_CQ_Handle *h)
 {
-    return h->count;
+    if (!h) return 0;
+    __disable_irq();
+    int32_t c = h->count;
+    __enable_irq();
+    return c;
 }
 
 void EncoderEXTI_CQ_Reset(EncoderEXTI_CQ_Handle *h)
 {
+    if (!h) return;
+    __disable_irq();
     h->count = 0;
-    h->last_ab = read_ab(h->gpioA, h->pinA, h->gpioB, h->pinB);
-}
-
-/* ===================== MOTOR L298 GPIO ===================== */
-void MotorL298_CQ_Init(MotorL298_CQ_Handle *m)
-{
-    gpio_clock_enable(m->gpio_ena);
-    gpio_clock_enable(m->gpio_in1);
-    gpio_clock_enable(m->gpio_in2);
-
-    gpio_output_pp(m->gpio_ena, m->pin_ena);
-    gpio_output_pp(m->gpio_in1, m->pin_in1);
-    gpio_output_pp(m->gpio_in2, m->pin_in2);
-
-    MotorL298_CQ_Enable(m, 0);
-    MotorL298_CQ_SetDir(m, 0);
-}
-
-void MotorL298_CQ_Enable(MotorL298_CQ_Handle *m, uint8_t en)
-{
-    uint32_t b = (1U << m->pin_ena);
-    if (en) m->gpio_ena->BSRR = b;
-    else    m->gpio_ena->BSRR = (b << 16);
-}
-
-void MotorL298_CQ_SetDir(MotorL298_CQ_Handle *m, int8_t dir)
-{
-    uint32_t b1 = (1U << m->pin_in1);
-    uint32_t b2 = (1U << m->pin_in2);
-
-    if (dir > 0) {
-        /* forward: IN1=1, IN2=0 */
-        m->gpio_in1->BSRR = b1;
-        m->gpio_in2->BSRR = (b2 << 16);
-    } else if (dir < 0) {
-        /* reverse: IN1=0, IN2=1 */
-        m->gpio_in1->BSRR = (b1 << 16);
-        m->gpio_in2->BSRR = b2;
-    } else {
-        /* stop: IN1=0, IN2=0 */
-        m->gpio_in1->BSRR = (b1 << 16);
-        m->gpio_in2->BSRR = (b2 << 16);
-    }
+    __enable_irq();
 }
