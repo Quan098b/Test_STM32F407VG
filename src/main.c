@@ -10,7 +10,7 @@
 #define BAUDRATE 115200U
 
 /* ================== ENCODER ================== */
-#define COUNTS_PER_REV     1000L   /* hiện bạn đang dùng; giữ để tối ưu profile */
+#define COUNTS_PER_REV     1000L   /* giữ như bạn đang dùng */
 
 /* ================== L298 Soft PWM ================== */
 #define PWM_PERIOD_MS      5U
@@ -21,17 +21,25 @@
 #define MIN_RUN_MS         120U
 
 /* Speed limits */
-#define SPEED_FAST_8BIT     70U
-#define SPEED_SLOW_8BIT     35U    /* chỉ để 1 lần, không define 2 lần */
+#define SPEED_FAST_8BIT     65U
+#define SPEED_SLOW_8BIT     35U
 
-/* Brake */
-#define BRAKE_MS           300U
+/* Brake: lớn/nhỏ tách riêng */
+#define BRAKE_MS_BIG       120U
+#define BRAKE_MS_SMALL      0U   /* LỆNH NHỎ: không phanh cưỡng bức để tránh giật ngược */
 
-/* Ramp vùng giảm tốc: giảm từ FAST -> SLOW trong N vòng cuối
-   Với lệnh lớn, N lớn sẽ giảm overshoot rõ rệt */
-#define SLOW_RAMP_REVS      6L     /* 6 vòng cuối bắt đầu hạ tốc */
-#define FINAL_REVS_NUM      1L     /* vùng sát đích: 1/5 vòng */
+/* Ramp vùng giảm tốc */
+#define SLOW_RAMP_REVS      8L     /* tăng ramp để giảm quán tính */
+#define FINAL_REVS_NUM      1L
 #define FINAL_REVS_DEN      5L
+
+/* Stop margin (dừng sớm) */
+#define BIG_CMD_REVS_THRESHOLD 15L  /* >15 vòng xem là lệnh lớn */
+#define STOP_MARGIN_REVS_BIG    1L  /* giảm xuống 1 vòng (2 vòng có thể gây thiếu mạnh) */
+#define STOP_MARGIN_REVS_SMALL  0L
+
+/* Nhóm “lệnh nhỏ” để tắt BRAKE hoàn toàn */
+#define SMALL_CMD_REVS_MAX      5L
 
 #define PRINT_PERIOD_MS    500U
 #define NO_MOVE_RESET_MS   2000U
@@ -130,11 +138,7 @@ static int cmd_poll_line(char *out, uint32_t out_sz)
 
 static inline int32_t iabs32(int32_t x) { return (x < 0) ? -x : x; }
 
-/* ===== Speed profile helper: linear ramp by remain =====
-   - remain > ramp_counts  -> FAST
-   - remain in [final_counts .. ramp_counts] -> interpolate FAST->SLOW
-   - remain < final_counts -> very slow (SLOW) to minimize overshoot
-*/
+/* ===== Speed profile helper: linear ramp by remain ===== */
 static uint8_t speed_from_remain(int32_t remain_counts, int32_t ramp_counts, int32_t final_counts)
 {
     if (remain_counts <= 0) return SPEED_SLOW_8BIT;
@@ -143,10 +147,6 @@ static uint8_t speed_from_remain(int32_t remain_counts, int32_t ramp_counts, int
 
     if (remain_counts <= final_counts) return SPEED_SLOW_8BIT;
 
-    /* linear interpolation:
-       t = (remain - final) / (ramp - final) in (0..1)
-       speed = SLOW + t*(FAST-SLOW)
-    */
     int32_t num = (remain_counts - final_counts);
     int32_t den = (ramp_counts - final_counts);
     if (den <= 0) return SPEED_SLOW_8BIT;
@@ -183,11 +183,16 @@ int main(void)
     printf("KICK=%u/255 %ums | MIN_RUN=%ums | FAST=%u | SLOW=%u\n",
            (unsigned)SPEED_KICK_8BIT, (unsigned)KICK_MS,
            (unsigned)MIN_RUN_MS, (unsigned)SPEED_FAST_8BIT, (unsigned)SPEED_SLOW_8BIT);
-    printf("RAMP=%ld revs | FINAL=%ld/%ld rev | BRAKE=%ums\n",
-           (long)SLOW_RAMP_REVS, (long)FINAL_REVS_NUM, (long)FINAL_REVS_DEN, (unsigned)BRAKE_MS);
+    printf("RAMP=%ld revs | FINAL=%ld/%ld rev\n",
+           (long)SLOW_RAMP_REVS, (long)FINAL_REVS_NUM, (long)FINAL_REVS_DEN);
+    printf("BRAKE_BIG=%ums | BRAKE_SMALL=%ums | SMALL<=%ld rev\n",
+           (unsigned)BRAKE_MS_BIG, (unsigned)BRAKE_MS_SMALL, (long)SMALL_CMD_REVS_MAX);
+    printf("STOP_MARGIN_BIG=%ld rev | THRESH=%ld rev\n",
+           (long)STOP_MARGIN_REVS_BIG, (long)BIG_CMD_REVS_THRESHOLD);
 
     uint8_t running = 0;
     int32_t target_counts = 0;
+    long cmd_revs_signed = 0;
     uint32_t run_start_ms = 0;
 
     uint32_t last_print = millis_ms();
@@ -223,6 +228,8 @@ int main(void)
                 }
                 else
                 {
+                    cmd_revs_signed = rev_cmd;
+
                     long rev_abs = (rev_cmd > 0) ? rev_cmd : -rev_cmd;
                     target_counts = (int32_t)(rev_abs * (long)COUNTS_PER_REV);
 
@@ -233,7 +240,6 @@ int main(void)
                     if (rev_cmd > 0) L298_SetDir(&mot, L298_DIR_FWD);
                     else             L298_SetDir(&mot, L298_DIR_REV);
 
-                    /* Kick */
                     L298_SetSpeed8(&mot, SPEED_KICK_8BIT);
                     L298_Enable(&mot, 1);
 
@@ -270,37 +276,69 @@ int main(void)
 
                 uint32_t run_age = now - run_start_ms;
 
-                /* kick */
                 if (run_age < KICK_MS) {
                     L298_SetSpeed8(&mot, SPEED_KICK_8BIT);
                 } else {
-                    /* ramp region */
                     int32_t ramp_counts  = (int32_t)(SLOW_RAMP_REVS * (long)COUNTS_PER_REV);
                     int32_t final_counts = (int32_t)((FINAL_REVS_NUM * (long)COUNTS_PER_REV) / FINAL_REVS_DEN);
-
                     uint8_t sp = speed_from_remain(remain, ramp_counts, final_counts);
                     L298_SetSpeed8(&mot, sp);
                 }
 
-                if (run_age >= MIN_RUN_MS && mag >= target_counts)
+                long cmd_revs_abs = (cmd_revs_signed > 0) ? cmd_revs_signed : -cmd_revs_signed;
+
+                /* stop margin */
+                int32_t stop_margin = 0;
+                if (cmd_revs_abs >= BIG_CMD_REVS_THRESHOLD) {
+                    stop_margin = (int32_t)(STOP_MARGIN_REVS_BIG * (long)COUNTS_PER_REV);
+                } else {
+                    stop_margin = (int32_t)(STOP_MARGIN_REVS_SMALL * (long)COUNTS_PER_REV);
+                }
+
+                int32_t stop_at = target_counts - stop_margin;
+                if (stop_at < 0) stop_at = 0;
+
+                if (run_age >= MIN_RUN_MS && mag >= stop_at)
                 {
                     running = 0;
 
-                    L298_SetDutyPercent(&mot, 100);
-                    L298_Enable(&mot, 1);
-                    L298_Brake(&mot);
+                    /* Ghi nhận ngay tại thời điểm vào dừng */
+                    int32_t stop_cnt = EncoderEXTI_CQ_GetCount(&g_enc);
+                    int32_t stop_mag = iabs32(stop_cnt);
 
-                    uint32_t t0 = millis_ms();
-                    while ((millis_ms() - t0) < BRAKE_MS) {
-                        EncoderEXTI_CQ_Task(&g_enc);
-                        L298_Task(&mot, millis_ms());
+                    /* Quy tắc: lệnh nhỏ -> không brake để tránh giật ngược */
+                    uint32_t brake_ms = 0;
+                    if (cmd_revs_abs <= SMALL_CMD_REVS_MAX) {
+                        brake_ms = BRAKE_MS_SMALL; /* hiện =0 */
+                        L298_Coast(&mot);
+                        L298_Enable(&mot, 0);
+                    } else {
+                        brake_ms = BRAKE_MS_BIG;
+                        L298_SetDutyPercent(&mot, 100);
+                        L298_Enable(&mot, 1);
+                        L298_Brake(&mot);
+
+                        uint32_t t0 = millis_ms();
+                        while ((millis_ms() - t0) < brake_ms) {
+                            EncoderEXTI_CQ_Task(&g_enc);
+                            L298_Task(&mot, millis_ms());
+                        }
+
+                        L298_Coast(&mot);
+                        L298_Enable(&mot, 0);
                     }
 
-                    L298_Coast(&mot);
-                    L298_Enable(&mot, 0);
+                    /* Đọc lại sau pha dừng/phanh */
+                    int32_t final_cnt = EncoderEXTI_CQ_GetCount(&g_enc);
+                    int32_t final_mag = iabs32(final_cnt);
 
-                    float rev_done = (float)mag / (float)COUNTS_PER_REV;
-                    printf("DONE: cnt=%ld (~%.3f vong)\n", (long)mag, rev_done);
+                    int32_t delta = (int32_t)final_mag - (int32_t)stop_mag; /* >0: trôi thêm, <0: giật ngược */
+                    float rev_done = (float)final_mag / (float)COUNTS_PER_REV;
+
+                    printf("DONE: final=%ld (~%.3f vong) | stop=%ld | delta=%ld | stop_at=%ld | margin=%ld | brake=%ums\n",
+                           (long)final_mag, rev_done,
+                           (long)stop_mag, (long)delta,
+                           (long)stop_at, (long)stop_margin, (unsigned)brake_ms);
                 }
             }
         }
