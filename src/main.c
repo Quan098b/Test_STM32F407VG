@@ -4,36 +4,36 @@
 #include <string.h>
 
 #include "Thu_vien_L298.h"
-#include "Motor_Encoder_Cua_Quan.h"   /* thư viện encoder EXTI của bạn */
+#include "Motor_Encoder_Cua_Quan.h"
 
 /* ================= UART ================= */
 #define BAUDRATE 115200U
 
-/* ================== ENCODER ==================
-   Bạn đang dùng: ENCODER_PPR=600, x4 => 2400 counts/vòng.
-   Với GA37, thông số này rất dễ KHÔNG đúng theo trục ra.
-   Hãy hiệu chuẩn: quay đúng 1 vòng trục ra -> đọc cnt tăng bao nhiêu -> đặt COUNTS_PER_REV theo thực tế.
-*/
-#define ENCODER_PPR        600L
-#define ENCODER_QUAD_MULT  4L
-#define COUNTS_PER_REV     (ENCODER_PPR * ENCODER_QUAD_MULT)
+/* ================== ENCODER ================== */
+#define COUNTS_PER_REV     1000L   /* hiện bạn đang dùng; giữ để tối ưu profile */
 
-/* ================== L298 Soft PWM ==================
-   PWM mềm chỉ để giảm tốc cơ bản (không mượt như timer PWM).
-   period 2..10ms (100..500Hz).
-*/
+/* ================== L298 Soft PWM ================== */
 #define PWM_PERIOD_MS      5U
 
-/* Điều khiển chống vượt: 2 pha FAST -> SLOW + BRAKE */
-#define SPEED_FAST_8BIT    120U     /* 0..255 */
-#define SPEED_SLOW_8BIT    35U      /* 0..255: tốc độ tiến gần */
-#define SLOW_BAND_COUNTS   (COUNTS_PER_REV / 3)  /* còn ~0.33 vòng thì giảm tốc */
-#define BRAKE_MS           200U     /* thắng điện */
+/* Kick + min-run */
+#define SPEED_KICK_8BIT    140U
+#define KICK_MS            180U
+#define MIN_RUN_MS         120U
 
-/* In trạng thái */
+/* Speed limits */
+#define SPEED_FAST_8BIT     70U
+#define SPEED_SLOW_8BIT     35U    /* chỉ để 1 lần, không define 2 lần */
+
+/* Brake */
+#define BRAKE_MS           300U
+
+/* Ramp vùng giảm tốc: giảm từ FAST -> SLOW trong N vòng cuối
+   Với lệnh lớn, N lớn sẽ giảm overshoot rõ rệt */
+#define SLOW_RAMP_REVS      6L     /* 6 vòng cuối bắt đầu hạ tốc */
+#define FINAL_REVS_NUM      1L     /* vùng sát đích: 1/5 vòng */
+#define FINAL_REVS_DEN      5L
+
 #define PRINT_PERIOD_MS    500U
-
-/* Nếu đang chạy mà 2s không có xung -> reset encoder, dừng */
 #define NO_MOVE_RESET_MS   2000U
 
 /* ================== SysTick ms ================== */
@@ -55,16 +55,15 @@ static void usart2_init_tx_rx(void)
     RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
     RCC->APB1ENR |= RCC_APB1ENR_USART2EN;
 
-    /* PA2 TX, PA3 RX: AF7 */
     GPIOA->MODER &= ~(3U << (2U * 2U));
     GPIOA->MODER |=  (2U << (2U * 2U));
-    GPIOA->MODER &= ~(3U << (3U * 2U));
-    GPIOA->MODER |=  (2U << (3U * 2U));
+    GPIOA->MODER &= ~(3U << (2U * 3U));
+    GPIOA->MODER |=  (2U << (2U * 3U));
 
-    GPIOA->AFR[0] &= ~(0xFU << (2U * 4U));
-    GPIOA->AFR[0] |=  (7U   << (2U * 4U));
-    GPIOA->AFR[0] &= ~(0xFU << (3U * 4U));
-    GPIOA->AFR[0] |=  (7U   << (3U * 4U));
+    GPIOA->AFR[0] &= ~(0xFU << (4U * 2U));
+    GPIOA->AFR[0] |=  (7U   << (4U * 2U));
+    GPIOA->AFR[0] &= ~(0xFU << (4U * 3U));
+    GPIOA->AFR[0] |=  (7U   << (4U * 3U));
 
     USART2->CR1 = 0;
     USART2->CR2 = 0;
@@ -105,7 +104,6 @@ static int usart2_read_byte_nonblock(void)
 static char g_cmd_buf[CMD_BUF_SZ];
 static uint8_t g_cmd_len = 0;
 
-/* return 1 if received a full line */
 static int cmd_poll_line(char *out, uint32_t out_sz)
 {
     int ch;
@@ -113,7 +111,7 @@ static int cmd_poll_line(char *out, uint32_t out_sz)
     {
         if (ch == '\r' || ch == '\n')
         {
-            if (g_cmd_len == 0) return 0; /* ignore empty line */
+            if (g_cmd_len == 0) return 0;
             g_cmd_buf[g_cmd_len] = '\0';
             strncpy(out, g_cmd_buf, out_sz - 1U);
             out[out_sz - 1U] = '\0';
@@ -130,34 +128,48 @@ static int cmd_poll_line(char *out, uint32_t out_sz)
     return 0;
 }
 
-/* ================== Encoder library binding ==================
-   Bạn dùng encoder EXTI thư viện Motor_Encoder_Cua_Quan.
-   PC7 + PC9 nằm trong EXTI9_5_IRQHandler.
-*/
-static EncoderEXTI_CQ_Handle g_enc;
-
-void EXTI9_5_IRQHandler(void)
-{
-    EncoderEXTI_CQ_IRQHandler(&g_enc);
-}
-
-/* ================== Helpers ================== */
 static inline int32_t iabs32(int32_t x) { return (x < 0) ? -x : x; }
 
-/* ================== Main ================== */
+/* ===== Speed profile helper: linear ramp by remain =====
+   - remain > ramp_counts  -> FAST
+   - remain in [final_counts .. ramp_counts] -> interpolate FAST->SLOW
+   - remain < final_counts -> very slow (SLOW) to minimize overshoot
+*/
+static uint8_t speed_from_remain(int32_t remain_counts, int32_t ramp_counts, int32_t final_counts)
+{
+    if (remain_counts <= 0) return SPEED_SLOW_8BIT;
+
+    if (remain_counts >= ramp_counts) return SPEED_FAST_8BIT;
+
+    if (remain_counts <= final_counts) return SPEED_SLOW_8BIT;
+
+    /* linear interpolation:
+       t = (remain - final) / (ramp - final) in (0..1)
+       speed = SLOW + t*(FAST-SLOW)
+    */
+    int32_t num = (remain_counts - final_counts);
+    int32_t den = (ramp_counts - final_counts);
+    if (den <= 0) return SPEED_SLOW_8BIT;
+
+    int32_t s = (int32_t)SPEED_SLOW_8BIT +
+                ( (int32_t)(SPEED_FAST_8BIT - SPEED_SLOW_8BIT) * num ) / den;
+
+    if (s < (int32_t)SPEED_SLOW_8BIT) s = SPEED_SLOW_8BIT;
+    if (s > (int32_t)SPEED_FAST_8BIT) s = SPEED_FAST_8BIT;
+    return (uint8_t)s;
+}
+
+/* ================== Encoder handle ================== */
+static EncoderEXTI_CQ_Handle g_enc;
+
 int main(void)
 {
     SystemCoreClockUpdate();
     SysTick_Config(SystemCoreClock / 1000U);
 
     usart2_init_tx_rx();
-
-    /* Encoder: C1=PC7, C2=PC9 */
-    g_enc.gpioA = GPIOC; g_enc.pinA = 7;
-    g_enc.gpioB = GPIOC; g_enc.pinB = 9;
     EncoderEXTI_CQ_Init(&g_enc);
 
-    /* L298: ENA=PC8, IN1=PC13, IN2=PE5 */
     L298_Pins_t pins = {
         .ENA_Port = GPIOC, .ENA_Pin = 8,
         .IN1_Port = GPIOC, .IN1_Pin = 13,
@@ -166,16 +178,17 @@ int main(void)
     L298_Handle_t mot;
     L298_Init(&mot, &pins, PWM_PERIOD_MS);
 
-    printf("START: L298(PC8/PC13/PE5) + Encoder(PC7/PC9)\n");
-    printf("COUNTS_PER_REV=%ld | PWM_PERIOD=%ums\n", (long)COUNTS_PER_REV, (unsigned)PWM_PERIOD_MS);
-    printf("Cmd: nhap so vong (vd: 3, -2, 0). RST de reset encoder.\n");
-    printf("FAST=%u/255 | SLOW=%u/255 | brake=%ums | slow_band=%ld counts\n",
-           (unsigned)SPEED_FAST_8BIT, (unsigned)SPEED_SLOW_8BIT,
-           (unsigned)BRAKE_MS, (long)SLOW_BAND_COUNTS);
+    printf("START: L298(PC8/PC13/PE5) + Encoder TIM3(PC6/PC7)\n");
+    printf("COUNTS_PER_REV=%ld\n", (long)COUNTS_PER_REV);
+    printf("KICK=%u/255 %ums | MIN_RUN=%ums | FAST=%u | SLOW=%u\n",
+           (unsigned)SPEED_KICK_8BIT, (unsigned)KICK_MS,
+           (unsigned)MIN_RUN_MS, (unsigned)SPEED_FAST_8BIT, (unsigned)SPEED_SLOW_8BIT);
+    printf("RAMP=%ld revs | FINAL=%ld/%ld rev | BRAKE=%ums\n",
+           (long)SLOW_RAMP_REVS, (long)FINAL_REVS_NUM, (long)FINAL_REVS_DEN, (unsigned)BRAKE_MS);
 
-    /* control state */
     uint8_t running = 0;
     int32_t target_counts = 0;
+    uint32_t run_start_ms = 0;
 
     uint32_t last_print = millis_ms();
     int32_t last_cnt = EncoderEXTI_CQ_GetCount(&g_enc);
@@ -187,15 +200,14 @@ int main(void)
     {
         uint32_t now = millis_ms();
 
-        /* always run soft PWM task */
+        EncoderEXTI_CQ_Task(&g_enc);
         L298_Task(&mot, now);
 
-        /* ========== 1) Receive command ========== */
         if (cmd_poll_line(line, sizeof(line)))
         {
             if (strcmp(line, "RST") == 0 || strcmp(line, "rst") == 0)
             {
-                EncoderEXTI_CQ_Reset(&g_enc); /* yêu cầu thư viện encoder có hàm reset */
+                EncoderEXTI_CQ_Reset(&g_enc);
                 printf("OK: encoder reset -> 0\n");
             }
             else
@@ -221,23 +233,23 @@ int main(void)
                     if (rev_cmd > 0) L298_SetDir(&mot, L298_DIR_FWD);
                     else             L298_SetDir(&mot, L298_DIR_REV);
 
-                    L298_SetSpeed8(&mot, SPEED_FAST_8BIT);
+                    /* Kick */
+                    L298_SetSpeed8(&mot, SPEED_KICK_8BIT);
                     L298_Enable(&mot, 1);
 
                     running = 1;
+                    run_start_ms = now;
 
                     printf("GO: rev=%ld -> target_counts=%ld\n", rev_cmd, (long)target_counts);
                 }
             }
         }
 
-        /* ========== 2) Run control if running ========== */
         if (running)
         {
             int32_t cnt = EncoderEXTI_CQ_GetCount(&g_enc);
             int32_t mag = iabs32(cnt);
 
-            /* detect no-move */
             if (cnt != last_cnt) {
                 last_cnt = cnt;
                 last_move_ms = now;
@@ -251,33 +263,36 @@ int main(void)
                 }
             }
 
-            /* 2-stage speed: FAST -> SLOW near target */
             if (running)
             {
                 int32_t remain = target_counts - mag;
                 if (remain < 0) remain = 0;
 
-                if (remain <= (int32_t)SLOW_BAND_COUNTS) {
-                    L298_SetSpeed8(&mot, SPEED_SLOW_8BIT);
+                uint32_t run_age = now - run_start_ms;
+
+                /* kick */
+                if (run_age < KICK_MS) {
+                    L298_SetSpeed8(&mot, SPEED_KICK_8BIT);
                 } else {
-                    L298_SetSpeed8(&mot, SPEED_FAST_8BIT);
+                    /* ramp region */
+                    int32_t ramp_counts  = (int32_t)(SLOW_RAMP_REVS * (long)COUNTS_PER_REV);
+                    int32_t final_counts = (int32_t)((FINAL_REVS_NUM * (long)COUNTS_PER_REV) / FINAL_REVS_DEN);
+
+                    uint8_t sp = speed_from_remain(remain, ramp_counts, final_counts);
+                    L298_SetSpeed8(&mot, sp);
                 }
 
-                /* reached target -> brake then stop */
-                if (mag >= target_counts)
+                if (run_age >= MIN_RUN_MS && mag >= target_counts)
                 {
                     running = 0;
 
-                    /* brake phase:
-                       To brake effectively with L298: IN1=IN2=1 and ENA active.
-                       We force duty 100% during brake hold.
-                    */
                     L298_SetDutyPercent(&mot, 100);
                     L298_Enable(&mot, 1);
                     L298_Brake(&mot);
 
                     uint32_t t0 = millis_ms();
                     while ((millis_ms() - t0) < BRAKE_MS) {
+                        EncoderEXTI_CQ_Task(&g_enc);
                         L298_Task(&mot, millis_ms());
                     }
 
@@ -291,11 +306,9 @@ int main(void)
         }
         else
         {
-            /* ensure disabled */
             L298_Enable(&mot, 0);
         }
 
-        /* ========== 3) Periodic print ========== */
         if ((now - last_print) >= PRINT_PERIOD_MS)
         {
             last_print = now;
@@ -305,14 +318,8 @@ int main(void)
 
             float rev = (float)a / (float)COUNTS_PER_REV;
 
-            int32_t turns = a / (int32_t)COUNTS_PER_REV;
-            int32_t rem   = a % (int32_t)COUNTS_PER_REV;
-
-            printf("run=%u | cnt=%ld (abs=%ld) | rev=%.3f | %ld vong + %ld/%ld\n",
-                   (unsigned)running,
-                   (long)c, (long)a,
-                   rev,
-                   (long)turns, (long)rem, (long)COUNTS_PER_REV);
+            printf("run=%u | cnt=%ld (abs=%ld) | rev=%.3f\n",
+                   (unsigned)running, (long)c, (long)a, rev);
         }
     }
 }

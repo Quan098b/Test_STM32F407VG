@@ -8,22 +8,28 @@
 extern "C" {
 #endif
 
+/*
+  Thư viện encoder phiên bản ổn định:
+  - Dùng TIM3 Encoder Interface (hardware quadrature)
+  - Chân:
+      PC6 = TIM3_CH1 (AF2)
+      PC7 = TIM3_CH2 (AF2)
+  - TIM3->CNT là 16-bit; mở rộng lên count32 bằng EncoderEXTI_CQ_Task().
+*/
+
+/* Giữ tên type cũ để main.c ít phải sửa */
 typedef struct
 {
-    GPIO_TypeDef *gpioA;  /* kênh A */
-    uint8_t       pinA;   /* 0..15 */
-    GPIO_TypeDef *gpioB;  /* kênh B */
-    uint8_t       pinB;   /* 0..15 */
-
-    volatile int32_t count;     /* tổng count (có dấu) */
-    volatile uint8_t prev_ab;   /* trạng thái trước (B<<1)|A */
+    TIM_TypeDef *tim;            /* TIM3 */
+    volatile int32_t count32;    /* mở rộng 32-bit */
+    volatile uint16_t prev_cnt;  /* CNT 16-bit lần trước */
 } EncoderEXTI_CQ_Handle;
 
-/* Init encoder EXTI quadrature (both edges), pull-up, LUT decode */
+/* Init encoder TIM3 PC6/PC7 */
 void EncoderEXTI_CQ_Init(EncoderEXTI_CQ_Handle *h);
 
-/* Gọi trong EXTI9_5_IRQHandler (PC7/PC9 thuộc nhóm 5..9) */
-void EncoderEXTI_CQ_IRQHandler(EncoderEXTI_CQ_Handle *h);
+/* Gọi định kỳ trong main loop để cập nhật count32 */
+void EncoderEXTI_CQ_Task(EncoderEXTI_CQ_Handle *h);
 
 /* Get total count (atomic) */
 int32_t EncoderEXTI_CQ_GetCount(EncoderEXTI_CQ_Handle *h);
@@ -35,4 +41,4 @@ void EncoderEXTI_CQ_Reset(EncoderEXTI_CQ_Handle *h);
 }
 #endif
 
-#endif
+#endif /* MOTOR_ENCODER_CUA_QUAN_H */

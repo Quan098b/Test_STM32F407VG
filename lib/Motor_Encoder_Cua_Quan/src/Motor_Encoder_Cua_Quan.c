@@ -1,136 +1,102 @@
 #include "Motor_Encoder_Cua_Quan.h"
 
-/* LUT quadrature chuẩn: state=(B<<1)|A; idx=(prev<<2)|curr */
-static const int8_t ENC_LUT[16] = {
-     0, -1, +1,  0,
-    +1,  0,  0, -1,
-    -1,  0,  0, +1,
-     0, +1, -1,  0
-};
-
-static inline uint8_t read_pin(GPIO_TypeDef *gpio, uint8_t pin)
+/* PC6=TIM3_CH1 (AF2), PC7=TIM3_CH2 (AF2) */
+static inline void gpio_pc6_pc7_af2_input_pullup(void)
 {
-    return (gpio->IDR & (1U << pin)) ? 1U : 0U;
-}
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOCEN;
 
-static inline uint8_t read_ab(EncoderEXTI_CQ_Handle *h)
-{
-    uint8_t a = read_pin(h->gpioA, h->pinA);
-    uint8_t b = read_pin(h->gpioB, h->pinB);
-    return (uint8_t)((b << 1) | a);
-}
+    /* Alternate function mode */
+    GPIOC->MODER &= ~(3U << (2U * 6U));
+    GPIOC->MODER &= ~(3U << (2U * 7U));
+    GPIOC->MODER |=  (2U << (2U * 6U));
+    GPIOC->MODER |=  (2U << (2U * 7U));
 
-static void gpio_input_pullup(GPIO_TypeDef *gpio, uint8_t pin)
-{
-    gpio->MODER &= ~(3U << (pin * 2U));      /* input */
-    gpio->PUPDR &= ~(3U << (pin * 2U));
-    gpio->PUPDR |=  (1U << (pin * 2U));      /* pull-up */
-}
+    /* Pull-up (an toàn cho encoder open-collector; nếu encoder push-pull cũng không sao) */
+    GPIOC->PUPDR &= ~(3U << (2U * 6U));
+    GPIOC->PUPDR &= ~(3U << (2U * 7U));
+    GPIOC->PUPDR |=  (1U << (2U * 6U));
+    GPIOC->PUPDR |=  (1U << (2U * 7U));
 
-/* Map EXTI line to port:
-   EXTICR index = line/4, shift = (line%4)*4
-   portcode: A=0, B=1, C=2, D=3, E=4 ...
-*/
-static void exti_map_line_to_port(uint8_t line, uint8_t portcode)
-{
-    uint32_t idx = line / 4U;
-    uint32_t sh  = (line % 4U) * 4U;
-
-    SYSCFG->EXTICR[idx] &= ~(0xFU << sh);
-    SYSCFG->EXTICR[idx] |=  ((uint32_t)portcode << sh);
+    /* AF2 */
+    GPIOC->AFR[0] &= ~(0xFU << (4U * 6U));
+    GPIOC->AFR[0] &= ~(0xFU << (4U * 7U));
+    GPIOC->AFR[0] |=  (2U   << (4U * 6U));
+    GPIOC->AFR[0] |=  (2U   << (4U * 7U));
 }
 
 void EncoderEXTI_CQ_Init(EncoderEXTI_CQ_Handle *h)
 {
-    if (!h || !h->gpioA || !h->gpioB) return;
-
-    /* Enable GPIO clocks (AHB1) */
-    if (h->gpioA == GPIOA) RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
-    if (h->gpioA == GPIOB) RCC->AHB1ENR |= RCC_AHB1ENR_GPIOBEN;
-    if (h->gpioA == GPIOC) RCC->AHB1ENR |= RCC_AHB1ENR_GPIOCEN;
-    if (h->gpioA == GPIOD) RCC->AHB1ENR |= RCC_AHB1ENR_GPIODEN;
-    if (h->gpioA == GPIOE) RCC->AHB1ENR |= RCC_AHB1ENR_GPIOEEN;
-
-    if (h->gpioB == GPIOA) RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
-    if (h->gpioB == GPIOB) RCC->AHB1ENR |= RCC_AHB1ENR_GPIOBEN;
-    if (h->gpioB == GPIOC) RCC->AHB1ENR |= RCC_AHB1ENR_GPIOCEN;
-    if (h->gpioB == GPIOD) RCC->AHB1ENR |= RCC_AHB1ENR_GPIODEN;
-    if (h->gpioB == GPIOE) RCC->AHB1ENR |= RCC_AHB1ENR_GPIOEEN;
-
-    /* SYSCFG for EXTI mapping */
-    RCC->APB2ENR |= RCC_APB2ENR_SYSCFGEN;
-
-    gpio_input_pullup(h->gpioA, h->pinA);
-    gpio_input_pullup(h->gpioB, h->pinB);
-
-    /* Determine portcode from gpio pointer */
-    uint8_t portA = 0, portB = 0;
-    if (h->gpioA == GPIOA) portA = 0;
-    else if (h->gpioA == GPIOB) portA = 1;
-    else if (h->gpioA == GPIOC) portA = 2;
-    else if (h->gpioA == GPIOD) portA = 3;
-    else if (h->gpioA == GPIOE) portA = 4;
-
-    if (h->gpioB == GPIOA) portB = 0;
-    else if (h->gpioB == GPIOB) portB = 1;
-    else if (h->gpioB == GPIOC) portB = 2;
-    else if (h->gpioB == GPIOD) portB = 3;
-    else if (h->gpioB == GPIOE) portB = 4;
-
-    /* Map lines */
-    exti_map_line_to_port(h->pinA, portA);
-    exti_map_line_to_port(h->pinB, portB);
-
-    /* Enable EXTI both edges */
-    EXTI->IMR  |= (1U << h->pinA) | (1U << h->pinB);
-    EXTI->RTSR |= (1U << h->pinA) | (1U << h->pinB);
-    EXTI->FTSR |= (1U << h->pinA) | (1U << h->pinB);
-
-    /* Clear pending */
-    EXTI->PR = (1U << h->pinA) | (1U << h->pinB);
-
-    h->count = 0;
-    h->prev_ab = read_ab(h);
-
-    /* NOTE: PC7/PC9 nằm trong EXTI9_5_IRQn */
-    NVIC_SetPriority(EXTI9_5_IRQn, 5);
-    NVIC_EnableIRQ(EXTI9_5_IRQn);
-}
-
-void EncoderEXTI_CQ_IRQHandler(EncoderEXTI_CQ_Handle *h)
-{
     if (!h) return;
 
-    uint32_t mask = (1U << h->pinA) | (1U << h->pinB);
-    uint32_t pr = EXTI->PR;
+    h->tim = TIM3;
+    h->count32 = 0;
+    h->prev_cnt = 0;
 
-    if (pr & mask)
-    {
-        /* clear pending */
-        EXTI->PR = mask;
+    gpio_pc6_pc7_af2_input_pullup();
 
-        uint8_t curr = read_ab(h);
-        uint8_t idx  = (uint8_t)((h->prev_ab << 2) | curr);
-        int8_t d = ENC_LUT[idx];
+    /* TIM3 clock enable */
+    RCC->APB1ENR |= RCC_APB1ENR_TIM3EN;
 
-        if (d) h->count += d;
-        h->prev_ab = curr;
-    }
+    /* Stop counter */
+    TIM3->CR1 &= ~TIM_CR1_CEN;
+
+    /* Base config */
+    TIM3->PSC = 0;
+    TIM3->ARR = 0xFFFF;
+    TIM3->CNT = 0;
+
+    /* Encoder mode 3 (x4): SMS=011 */
+    TIM3->SMCR &= ~TIM_SMCR_SMS;
+    TIM3->SMCR |=  (3U << TIM_SMCR_SMS_Pos);
+
+    /* CC1S=01 (TI1), CC2S=01 (TI2) */
+    TIM3->CCMR1 &= ~(TIM_CCMR1_CC1S | TIM_CCMR1_CC2S);
+    TIM3->CCMR1 |=  (1U << TIM_CCMR1_CC1S_Pos);
+    TIM3->CCMR1 |=  (1U << TIM_CCMR1_CC2S_Pos);
+
+    /* Digital filter chống nhiễu mức vừa: IC1F=3, IC2F=3 */
+    TIM3->CCMR1 &= ~(TIM_CCMR1_IC1F | TIM_CCMR1_IC2F);
+    TIM3->CCMR1 |=  (3U << TIM_CCMR1_IC1F_Pos);
+    TIM3->CCMR1 |=  (3U << TIM_CCMR1_IC2F_Pos);
+
+    /* Polarity mặc định (rising), enable capture */
+    TIM3->CCER &= ~(TIM_CCER_CC1P | TIM_CCER_CC2P);
+    TIM3->CCER &= ~(TIM_CCER_CC1NP | TIM_CCER_CC2NP);
+    TIM3->CCER |= (TIM_CCER_CC1E | TIM_CCER_CC2E);
+
+    /* Init prev */
+    h->prev_cnt = (uint16_t)TIM3->CNT;
+
+    /* Start */
+    TIM3->CR1 |= TIM_CR1_CEN;
+}
+
+void EncoderEXTI_CQ_Task(EncoderEXTI_CQ_Handle *h)
+{
+    if (!h || !h->tim) return;
+
+    uint16_t curr = (uint16_t)h->tim->CNT;
+    int16_t d = (int16_t)(curr - h->prev_cnt); /* tự xử lý wrap 16-bit */
+
+    h->count32 += (int32_t)d;
+    h->prev_cnt = curr;
 }
 
 int32_t EncoderEXTI_CQ_GetCount(EncoderEXTI_CQ_Handle *h)
 {
     if (!h) return 0;
     __disable_irq();
-    int32_t c = h->count;
+    int32_t c = h->count32;
     __enable_irq();
     return c;
 }
 
 void EncoderEXTI_CQ_Reset(EncoderEXTI_CQ_Handle *h)
 {
-    if (!h) return;
+    if (!h || !h->tim) return;
     __disable_irq();
-    h->count = 0;
+    h->tim->CNT = 0;
+    h->prev_cnt = 0;
+    h->count32  = 0;
     __enable_irq();
 }
