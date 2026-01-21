@@ -10,7 +10,7 @@
 #define BAUDRATE 115200U
 
 /* ================== ENCODER ================== */
-#define COUNTS_PER_REV     1000L   /* nếu encoder L khác, hãy tách CPR_L riêng */
+#define COUNTS_PER_REV     1000L   /* nếu encoder khác nhau, hãy tách CPR riêng */
 
 /* ================== L298 Soft PWM ================== */
 #define PWM_PERIOD_MS      5U
@@ -49,34 +49,35 @@
 #define AUTO_TEST_SPEED8   140U
 #define AUTO_TEST_DIR_FWD  1      /* 1: thuận, 0: nghịch */
 
-/* ================== SYNC (2+1) ==================
-   - A và B đồng bộ theo sai lệch tiến độ (P-coupling)
-   - L bám theo tiến độ trung bình cụm phải: progR=(A+B)/2
+/* ================== SYNC (2+2) ==================
+   - Cụm phải: A và B đồng bộ theo sai lệch tiến độ (P-coupling)
+   - Cụm trái: LF và LS đồng bộ theo sai lệch tiến độ (P-coupling)
+   - Cụm trái bám theo tiến độ cụm phải: progR=(A+B)/2
+   - HƯỚNG B: điều kiện DỪNG theo progR (không dùng prog_min)
 */
 #define SYNC_ENABLE        1
 
-/* Gain P cho AB và cho L (có thể tách riêng để dễ tuning) */
 #define SYNC_ERR_DIV_AB       200
-#define SYNC_ERR_DIV_L        200
+#define SYNC_ERR_DIV_LL       200   /* LF vs LS */
+#define SYNC_ERR_DIV_L_FOLLOW 200   /* (LF+LS)/2 bám progR */
 
 #define SYNC_MAX_CORR_8BIT    40
 
 #define SYNC_MIN_8BIT         20
-#define SYNC_MAX_8BIT         220   /* tăng nhẹ để L có “room” đuổi kịp */
+#define SYNC_MAX_8BIT         220
 
 /* ================== CÁCH B: BIAS/GAIN ==================
-   - GAIN: % (100 = giữ nguyên, 105 = +5%, 95 = -5%)
-   - BIAS: cộng/trừ trực tiếp vào duty8 (0..255)
-   Tuning:
-     - Nếu bánh nào chậm: tăng GAIN hoặc tăng BIAS bánh đó
+   Gợi ý: để 100 trước, rồi tăng/giảm nhẹ. 200 sẽ rất dễ bão hòa duty.
 */
 #define M1_GAIN_PCT        200   /* A: phải sau */
 #define M2_GAIN_PCT        200   /* B: phải trước */
-#define M3_GAIN_PCT        200   /* L: trái trước */
+#define M3_GAIN_PCT        200   /* LF: trái trước */
+#define M4_GAIN_PCT        200   /* LS: trái sau */
 
 #define M1_BIAS_8BIT       0
 #define M2_BIAS_8BIT       0
 #define M3_BIAS_8BIT       0
+#define M4_BIAS_8BIT       0
 
 /* ================== SysTick ms ================== */
 static volatile uint32_t g_ms = 0;
@@ -172,6 +173,7 @@ static int cmd_poll_line(char *out, uint32_t out_sz)
 }
 
 static inline int32_t iabs32(int32_t x) { return (x < 0) ? -x : x; }
+static inline int32_t imin32(int32_t a, int32_t b) { return (a < b) ? a : b; }
 
 static uint8_t clamp_u8(int32_t x)
 {
@@ -199,10 +201,10 @@ static uint8_t apply_calib(uint8_t duty, int32_t gain_pct, int32_t bias_8bit)
 
     return clamp_u8(d);
 }
-
 static uint8_t apply_calib_m1(uint8_t duty) { return apply_calib(duty, (int32_t)M1_GAIN_PCT, (int32_t)M1_BIAS_8BIT); }
 static uint8_t apply_calib_m2(uint8_t duty) { return apply_calib(duty, (int32_t)M2_GAIN_PCT, (int32_t)M2_BIAS_8BIT); }
 static uint8_t apply_calib_m3(uint8_t duty) { return apply_calib(duty, (int32_t)M3_GAIN_PCT, (int32_t)M3_BIAS_8BIT); }
+static uint8_t apply_calib_m4(uint8_t duty) { return apply_calib(duty, (int32_t)M4_GAIN_PCT, (int32_t)M4_BIAS_8BIT); }
 
 /* ===== Speed profile helper: linear ramp by remain ===== */
 static uint8_t speed_from_remain(int32_t remain_counts, int32_t ramp_counts, int32_t final_counts)
@@ -229,8 +231,8 @@ static int32_t encA_get_count(void) { return EncoderEXTI_CQ_GetCount(&g_enc1); }
 static void    encA_reset(void)     { EncoderEXTI_CQ_Reset(&g_enc1); }
 
 /* ================== Encoder #2 (B: EXTI PC9/PC8) ================== */
-static volatile int32_t  g_enc2_count32 = 0;
-static volatile uint8_t  g_enc2_lastAB  = 0;
+static volatile int32_t  g_encB_count32 = 0;
+static volatile uint8_t  g_encB_lastAB  = 0;
 
 static const int8_t QUAD_TABLE_B[16] = {
      0, -1, +1,  0,
@@ -266,7 +268,7 @@ static void encoderB_init_exti_pc8_pc9_pullup(void)
     EXTI->FTSR |= (1U << 8) | (1U << 9);
     EXTI->PR = (1U << 8) | (1U << 9);
 
-    g_enc2_lastAB = (uint8_t)((encB_readA_pc9() << 1) | encB_readB_pc8());
+    g_encB_lastAB = (uint8_t)((encB_readA_pc9() << 1) | encB_readB_pc8());
 
     NVIC_SetPriority(EXTI9_5_IRQn, 5);
     NVIC_EnableIRQ(EXTI9_5_IRQn);
@@ -282,16 +284,16 @@ void EXTI9_5_IRQHandler(void)
         uint8_t b  = encB_readB_pc8();
         uint8_t ab = (uint8_t)((a << 1) | b);
 
-        uint8_t idx = (uint8_t)((g_enc2_lastAB << 2) | ab);
-        g_enc2_count32 += (int32_t)QUAD_TABLE_B[idx];
-        g_enc2_lastAB = ab;
+        uint8_t idx = (uint8_t)((g_encB_lastAB << 2) | ab);
+        g_encB_count32 += (int32_t)QUAD_TABLE_B[idx];
+        g_encB_lastAB = ab;
     }
 }
 
 static int32_t encB_get_count(void)
 {
     __disable_irq();
-    int32_t c = g_enc2_count32;
+    int32_t c = g_encB_count32;
     __enable_irq();
     return c;
 }
@@ -299,15 +301,13 @@ static int32_t encB_get_count(void)
 static void encB_reset(void)
 {
     __disable_irq();
-    g_enc2_count32 = 0;
-    g_enc2_lastAB  = (uint8_t)((encB_readA_pc9() << 1) | encB_readB_pc8());
+    g_encB_count32 = 0;
+    g_encB_lastAB  = (uint8_t)((encB_readA_pc9() << 1) | encB_readB_pc8());
     __enable_irq();
 }
 
-/* ================== Encoder #3 (L: TIM1 encoder interface PA8/PA9) ==================
-   C1=PA8, C2=PA9
-*/
-static void encoderL_init_tim1_pa8_pa9_pullup(void)
+/* ================== Encoder #3 (LF: TIM1 PA8/PA9) ================== */
+static void encoderLF_init_tim1_pa8_pa9_pullup(void)
 {
     RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
     RCC->APB2ENR |= RCC_APB2ENR_TIM1EN;
@@ -337,66 +337,119 @@ static void encoderL_init_tim1_pa8_pa9_pullup(void)
     TIM1->ARR = 0xFFFFU;
     TIM1->PSC = 0;
 
-    /* CC1/CC2 as input mapped on TI1/TI2 */
     TIM1->CCMR1 = 0;
     TIM1->CCMR1 |= (1U << 0);   /* CC1S=01 */
     TIM1->CCMR1 |= (1U << 8);   /* CC2S=01 */
 
-    /* optional filter to reduce bounce/noise */
-    /* TIM1->CCMR1 |= (3U << 4);  // IC1F
-       TIM1->CCMR1 |= (3U << 12); // IC2F */
-
-    TIM1->CCER = 0;             /* default rising */
+    TIM1->CCER = 0;             /* rising */
     TIM1->SMCR |= (3U << 0);    /* SMS=011 encoder mode 3 */
     TIM1->CNT = 0;
 
     TIM1->CR1 |= TIM_CR1_CEN;
 }
 
-static int32_t encL_get_count(void)
-{
-    /* TIM CNT 16-bit signed extension */
-    static int32_t acc = 0;
-    static uint16_t last = 0;
-
-    uint16_t now = (uint16_t)TIM1->CNT;
-    int16_t diff = (int16_t)(now - last); /* signed wrap-safe */
-    last = now;
-    acc += (int32_t)diff;
-    return acc;
-}
-
-static void encL_reset(void)
-{
-    TIM1->CNT = 0;
-    /* reset software accumulator */
-    {
-        extern int32_t encL_get_count(void);
-        /* trick-free reset by reinitializing statics via local scope is not possible in C.
-           Use a dedicated static in module scope for correctness. */
-    }
-}
-
-/* Instead of relying on function statics reset, keep explicit state for L */
 static struct {
     int32_t acc;
     uint16_t last;
-} g_encL = {0,0};
+} g_encLF = {0,0};
 
-static int32_t encL_get_count2(void)
+static int32_t encLF_get_count(void)
 {
     uint16_t now = (uint16_t)TIM1->CNT;
-    int16_t diff = (int16_t)(now - g_encL.last);
-    g_encL.last = now;
-    g_encL.acc += (int32_t)diff;
-    return g_encL.acc;
+    int16_t diff = (int16_t)(now - g_encLF.last);
+    g_encLF.last = now;
+    g_encLF.acc += (int32_t)diff;
+    return g_encLF.acc;
 }
 
-static void encL_reset2(void)
+static void encLF_reset(void)
 {
     TIM1->CNT = 0;
-    g_encL.acc = 0;
-    g_encL.last = 0;
+    g_encLF.acc = 0;
+    g_encLF.last = 0;
+}
+
+/* ================== Encoder #4 (LS: EXTI PC11/PC10) ==================
+   C1=PC11, C2=PC10
+   Dùng EXTI line 11 và 10, IRQ EXTI15_10_IRQn
+*/
+static volatile int32_t  g_encLS_count32 = 0;
+static volatile uint8_t  g_encLS_lastAB  = 0;
+
+static const int8_t QUAD_TABLE_LS[16] = {
+     0, -1, +1,  0,
+    +1,  0,  0, -1,
+    -1,  0,  0, +1,
+     0, +1, -1,  0
+};
+
+static inline uint8_t encLS_readA_pc11(void) { return (GPIOC->IDR & (1U << 11)) ? 1U : 0U; } /* C1 */
+static inline uint8_t encLS_readB_pc10(void) { return (GPIOC->IDR & (1U << 10)) ? 1U : 0U; } /* C2 */
+
+static void encoderLS_init_exti_pc10_pc11_pullup(void)
+{
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOCEN;
+    (void)RCC->AHB1ENR;
+
+    RCC->APB2ENR |= RCC_APB2ENR_SYSCFGEN;
+    (void)RCC->APB2ENR;
+
+    /* PC10, PC11 input */
+    GPIOC->MODER &= ~(3U << (2U * 10U));
+    GPIOC->MODER &= ~(3U << (2U * 11U));
+
+    /* pull-up */
+    GPIOC->PUPDR &= ~(3U << (2U * 10U));
+    GPIOC->PUPDR &= ~(3U << (2U * 11U));
+    GPIOC->PUPDR |=  (1U << (2U * 10U));
+    GPIOC->PUPDR |=  (1U << (2U * 11U));
+
+    /* EXTI10/11 -> GPIOC (port C = 0x2) */
+    SYSCFG->EXTICR[2] &= ~((0xFU << 8) | (0xFU << 12));
+    SYSCFG->EXTICR[2] |=  ((0x2U << 8) | (0x2U << 12));
+
+    EXTI->IMR  |= (1U << 10) | (1U << 11);
+    EXTI->RTSR |= (1U << 10) | (1U << 11);
+    EXTI->FTSR |= (1U << 10) | (1U << 11);
+    EXTI->PR    = (1U << 10) | (1U << 11);
+
+    g_encLS_lastAB = (uint8_t)((encLS_readA_pc11() << 1) | encLS_readB_pc10());
+
+    NVIC_SetPriority(EXTI15_10_IRQn, 5);
+    NVIC_EnableIRQ(EXTI15_10_IRQn);
+}
+
+void EXTI15_10_IRQHandler(void)
+{
+    uint32_t pr = EXTI->PR;
+
+    if (pr & ((1U << 10) | (1U << 11))) {
+        EXTI->PR = (1U << 10) | (1U << 11);
+
+        uint8_t a  = encLS_readA_pc11();
+        uint8_t b  = encLS_readB_pc10();
+        uint8_t ab = (uint8_t)((a << 1) | b);
+
+        uint8_t idx = (uint8_t)((g_encLS_lastAB << 2) | ab);
+        g_encLS_count32 += (int32_t)QUAD_TABLE_LS[idx];
+        g_encLS_lastAB = ab;
+    }
+}
+
+static int32_t encLS_get_count(void)
+{
+    __disable_irq();
+    int32_t c = g_encLS_count32;
+    __enable_irq();
+    return c;
+}
+
+static void encLS_reset(void)
+{
+    __disable_irq();
+    g_encLS_count32 = 0;
+    g_encLS_lastAB  = (uint8_t)((encLS_readA_pc11() << 1) | encLS_readB_pc10());
+    __enable_irq();
 }
 
 /* ================== Motion state ================== */
@@ -420,12 +473,9 @@ static void motion_stop(L298_Handle_t *mot, Motion_t *st)
 static void motion_start_single(L298_Handle_t *mot, Motion_t *st,
                                 long rev_cmd, uint32_t now,
                                 void (*enc_reset_fn)(void),
-                                uint8_t which) /* 1=A, 2=B, 3=L */
+                                uint8_t which) /* 1=A, 2=B, 3=LF, 4=LS */
 {
-    if (rev_cmd == 0) {
-        motion_stop(mot, st);
-        return;
-    }
+    if (rev_cmd == 0) { motion_stop(mot, st); return; }
 
     st->cmd_revs_signed = rev_cmd;
     long ra = (rev_cmd > 0) ? rev_cmd : -rev_cmd;
@@ -442,7 +492,8 @@ static void motion_start_single(L298_Handle_t *mot, Motion_t *st,
         uint8_t duty = SPEED_KICK_8BIT;
         if (which == 1) duty = apply_calib_m1(duty);
         else if (which == 2) duty = apply_calib_m2(duty);
-        else duty = apply_calib_m3(duty);
+        else if (which == 3) duty = apply_calib_m3(duty);
+        else duty = apply_calib_m4(duty);
 
         L298_SetSpeed8(mot, duty);
     }
@@ -487,7 +538,8 @@ static void motion_update_single(L298_Handle_t *mot, Motion_t *st,
 
     if (which == 1) base = apply_calib_m1(base);
     else if (which == 2) base = apply_calib_m2(base);
-    else base = apply_calib_m3(base);
+    else if (which == 3) base = apply_calib_m3(base);
+    else base = apply_calib_m4(base);
 
     L298_SetSpeed8(mot, base);
 
@@ -528,100 +580,116 @@ static void motion_update_single(L298_Handle_t *mot, Motion_t *st,
     }
 }
 
-/* ================== SYNC (A,B) + L follow progR ================== */
+/* ================== SYNC (2+2) ================== */
 static uint8_t g_sync_all = 0;
 
-static void start_all(L298_Handle_t *mA, L298_Handle_t *mB, L298_Handle_t *mL,
-                      Motion_t *sA, Motion_t *sB, Motion_t *sL,
+static void start_all(L298_Handle_t *mA, L298_Handle_t *mB, L298_Handle_t *mLF, L298_Handle_t *mLS,
+                      Motion_t *sA, Motion_t *sB, Motion_t *sLF, Motion_t *sLS,
                       long rev_cmd, uint32_t now)
 {
     if (rev_cmd == 0) {
         motion_stop(mA, sA);
         motion_stop(mB, sB);
-        motion_stop(mL, sL);
+        motion_stop(mLF, sLF);
+        motion_stop(mLS, sLS);
         g_sync_all = 0;
         return;
     }
 
     encA_reset();
     encB_reset();
-    encL_reset2();
+    encLF_reset();
+    encLS_reset();
 
     long ra = (rev_cmd > 0) ? rev_cmd : -rev_cmd;
     int32_t target = (int32_t)(ra * (long)COUNTS_PER_REV);
 
-    sA->cmd_revs_signed = rev_cmd;
-    sB->cmd_revs_signed = rev_cmd;
-    sL->cmd_revs_signed = rev_cmd;
+    sA->cmd_revs_signed  = rev_cmd;
+    sB->cmd_revs_signed  = rev_cmd;
+    sLF->cmd_revs_signed = rev_cmd;
+    sLS->cmd_revs_signed = rev_cmd;
 
-    sA->target_counts = target;
-    sB->target_counts = target;
-    sL->target_counts = target;
+    sA->target_counts  = target;
+    sB->target_counts  = target;
+    sLF->target_counts = target;
+    sLS->target_counts = target;
 
-    sA->last_cnt = 0; sB->last_cnt = 0; sL->last_cnt = 0;
-    sA->last_move_ms = now; sB->last_move_ms = now; sL->last_move_ms = now;
+    sA->last_cnt = 0; sB->last_cnt = 0; sLF->last_cnt = 0; sLS->last_cnt = 0;
+    sA->last_move_ms = now; sB->last_move_ms = now; sLF->last_move_ms = now; sLS->last_move_ms = now;
 
     if (rev_cmd > 0) {
-        L298_SetDir(mA, L298_DIR_FWD);
-        L298_SetDir(mB, L298_DIR_FWD);
-        L298_SetDir(mL, L298_DIR_FWD);
+        L298_SetDir(mA,  L298_DIR_FWD);
+        L298_SetDir(mB,  L298_DIR_FWD);
+        L298_SetDir(mLF, L298_DIR_FWD);
+        L298_SetDir(mLS, L298_DIR_FWD);
     } else {
-        L298_SetDir(mA, L298_DIR_REV);
-        L298_SetDir(mB, L298_DIR_REV);
-        L298_SetDir(mL, L298_DIR_REV);
+        L298_SetDir(mA,  L298_DIR_REV);
+        L298_SetDir(mB,  L298_DIR_REV);
+        L298_SetDir(mLF, L298_DIR_REV);
+        L298_SetDir(mLS, L298_DIR_REV);
     }
 
-    L298_SetSpeed8(mA, apply_calib_m1(SPEED_KICK_8BIT));
-    L298_SetSpeed8(mB, apply_calib_m2(SPEED_KICK_8BIT));
-    L298_SetSpeed8(mL, apply_calib_m3(SPEED_KICK_8BIT));
+    L298_SetSpeed8(mA,  apply_calib_m1(SPEED_KICK_8BIT));
+    L298_SetSpeed8(mB,  apply_calib_m2(SPEED_KICK_8BIT));
+    L298_SetSpeed8(mLF, apply_calib_m3(SPEED_KICK_8BIT));
+    L298_SetSpeed8(mLS, apply_calib_m4(SPEED_KICK_8BIT));
 
-    L298_Enable(mA, 1);
-    L298_Enable(mB, 1);
-    L298_Enable(mL, 1);
+    L298_Enable(mA,  1);
+    L298_Enable(mB,  1);
+    L298_Enable(mLF, 1);
+    L298_Enable(mLS, 1);
 
-    sA->running = 1;
-    sB->running = 1;
-    sL->running = 1;
+    sA->running  = 1;
+    sB->running  = 1;
+    sLF->running = 1;
+    sLS->running = 1;
 
-    sA->run_start_ms = now;
-    sB->run_start_ms = now;
-    sL->run_start_ms = now;
+    sA->run_start_ms  = now;
+    sB->run_start_ms  = now;
+    sLF->run_start_ms = now;
+    sLS->run_start_ms = now;
 
     g_sync_all = 1;
 }
 
-static void sync_update_all(L298_Handle_t *mA, L298_Handle_t *mB, L298_Handle_t *mL,
-                            Motion_t *sA, Motion_t *sB, Motion_t *sL,
+static void sync_update_all(L298_Handle_t *mA, L298_Handle_t *mB, L298_Handle_t *mLF, L298_Handle_t *mLS,
+                            Motion_t *sA, Motion_t *sB, Motion_t *sLF, Motion_t *sLS,
                             uint32_t now)
 {
 #if !SYNC_ENABLE
-    motion_update_single(mA, sA, now, encA_get_count, "A", 1);
-    motion_update_single(mB, sB, now, encB_get_count, "B", 2);
-    motion_update_single(mL, sL, now, encL_get_count2, "L", 3);
+    motion_update_single(mA,  sA,  now, encA_get_count,  "A",  1);
+    motion_update_single(mB,  sB,  now, encB_get_count,  "B",  2);
+    motion_update_single(mLF, sLF, now, encLF_get_count, "LF", 3);
+    motion_update_single(mLS, sLS, now, encLS_get_count, "LS", 4);
     return;
 #endif
 
-    if (!sA->running || !sB->running || !sL->running) { g_sync_all = 0; return; }
+    if (!sA->running || !sB->running || !sLF->running || !sLS->running) { g_sync_all = 0; return; }
 
-    int32_t cA = encA_get_count();
-    int32_t cB = encB_get_count();
-    int32_t cL = encL_get_count2();
+    int32_t cA  = encA_get_count();
+    int32_t cB  = encB_get_count();
+    int32_t cLF = encLF_get_count();
+    int32_t cLS = encLS_get_count();
 
-    int32_t magA = iabs32(cA);
-    int32_t magB = iabs32(cB);
-    int32_t magL = iabs32(cL);
+    int32_t magA  = iabs32(cA);
+    int32_t magB  = iabs32(cB);
+    int32_t magLF = iabs32(cLF);
+    int32_t magLS = iabs32(cLS);
 
-    /* no-move detection */
-    if (cA != sA->last_cnt) { sA->last_cnt = cA; sA->last_move_ms = now; }
-    if (cB != sB->last_cnt) { sB->last_cnt = cB; sB->last_move_ms = now; }
-    if (cL != sL->last_cnt) { sL->last_cnt = cL; sL->last_move_ms = now; }
+    /* no-move detection (giữ nguyên) */
+    if (cA  != sA->last_cnt)  { sA->last_cnt  = cA;  sA->last_move_ms  = now; }
+    if (cB  != sB->last_cnt)  { sB->last_cnt  = cB;  sB->last_move_ms  = now; }
+    if (cLF != sLF->last_cnt) { sLF->last_cnt = cLF; sLF->last_move_ms = now; }
+    if (cLS != sLS->last_cnt) { sLS->last_cnt = cLS; sLS->last_move_ms = now; }
 
-    if ((now - sA->last_move_ms) >= NO_MOVE_RESET_MS ||
-        (now - sB->last_move_ms) >= NO_MOVE_RESET_MS ||
-        (now - sL->last_move_ms) >= NO_MOVE_RESET_MS) {
-        motion_stop(mA, sA);
-        motion_stop(mB, sB);
-        motion_stop(mL, sL);
+    if ((now - sA->last_move_ms)  >= NO_MOVE_RESET_MS ||
+        (now - sB->last_move_ms)  >= NO_MOVE_RESET_MS ||
+        (now - sLF->last_move_ms) >= NO_MOVE_RESET_MS ||
+        (now - sLS->last_move_ms) >= NO_MOVE_RESET_MS) {
+        motion_stop(mA,  sA);
+        motion_stop(mB,  sB);
+        motion_stop(mLF, sLF);
+        motion_stop(mLS, sLS);
         g_sync_all = 0;
         printf("WARN(SYNC): %ums khong thay xung -> stop all\n", (unsigned)NO_MOVE_RESET_MS);
         return;
@@ -650,23 +718,36 @@ static void sync_update_all(L298_Handle_t *mA, L298_Handle_t *mB, L298_Handle_t 
     int32_t dA = (int32_t)base - corrAB;
     int32_t dB = (int32_t)base + corrAB;
 
-    /* ===== L follow progR ===== */
-    int32_t errL  = magL - progR; /* >0: L đi trước cụm phải */
-    int32_t corrL = errL / SYNC_ERR_DIV_L;
-    corrL = clamp_i32(corrL, -(int32_t)SYNC_MAX_CORR_8BIT, (int32_t)SYNC_MAX_CORR_8BIT);
+    /* ===== Left follow + left pair coupling ===== */
+    int32_t progL = (magLF + magLS) / 2;
 
-    int32_t dL = (int32_t)base - corrL; /* L đi trước -> giảm duty; L chậm -> tăng duty */
+    /* group follow: left bám progR */
+    int32_t errLFol  = progL - progR; /* >0: left đi trước right */
+    int32_t corrLFol = errLFol / SYNC_ERR_DIV_L_FOLLOW;
+    corrLFol = clamp_i32(corrLFol, -(int32_t)SYNC_MAX_CORR_8BIT, (int32_t)SYNC_MAX_CORR_8BIT);
+
+    int32_t baseL = (int32_t)base - corrLFol; /* left ahead -> giảm duty; left chậm -> tăng */
+
+    /* LF vs LS pair coupling */
+    int32_t errLL  = magLF - magLS; /* >0: LF đi trước LS */
+    int32_t corrLL = errLL / SYNC_ERR_DIV_LL;
+    corrLL = clamp_i32(corrLL, -(int32_t)SYNC_MAX_CORR_8BIT, (int32_t)SYNC_MAX_CORR_8BIT);
+
+    int32_t dLF = baseL - corrLL;
+    int32_t dLS = baseL + corrLL;
 
     /* apply calibration after coupling */
-    uint8_t outA = apply_calib_m1(clamp_u8(dA));
-    uint8_t outB = apply_calib_m2(clamp_u8(dB));
-    uint8_t outL = apply_calib_m3(clamp_u8(dL));
+    uint8_t outA  = apply_calib_m1(clamp_u8(dA));
+    uint8_t outB  = apply_calib_m2(clamp_u8(dB));
+    uint8_t outLF = apply_calib_m3(clamp_u8(dLF));
+    uint8_t outLS = apply_calib_m4(clamp_u8(dLS));
 
-    L298_SetSpeed8(mA, outA);
-    L298_SetSpeed8(mB, outB);
-    L298_SetSpeed8(mL, outL);
+    L298_SetSpeed8(mA,  outA);
+    L298_SetSpeed8(mB,  outB);
+    L298_SetSpeed8(mLF, outLF);
+    L298_SetSpeed8(mLS, outLS);
 
-    /* ===== stop condition based on progR (cụm phải) ===== */
+    /* ===== stop condition: HƯỚNG B - dừng theo progR (cụm phải) ===== */
     long cmd_abs = (sA->cmd_revs_signed > 0) ? sA->cmd_revs_signed : -sA->cmd_revs_signed;
 
     int32_t stop_margin = 0;
@@ -678,42 +759,45 @@ static void sync_update_all(L298_Handle_t *mA, L298_Handle_t *mB, L298_Handle_t 
 
     if (run_age >= MIN_RUN_MS && progR >= stop_at)
     {
-        sA->running = 0;
-        sB->running = 0;
-        sL->running = 0;
+        sA->running = 0; sB->running = 0; sLF->running = 0; sLS->running = 0;
         g_sync_all = 0;
 
         uint32_t brake_ms = 0;
         if (cmd_abs <= SMALL_CMD_REVS_MAX) {
             brake_ms = BRAKE_MS_SMALL;
-            L298_Coast(mA); L298_Enable(mA, 0);
-            L298_Coast(mB); L298_Enable(mB, 0);
-            L298_Coast(mL); L298_Enable(mL, 0);
+            L298_Coast(mA);  L298_Enable(mA,  0);
+            L298_Coast(mB);  L298_Enable(mB,  0);
+            L298_Coast(mLF); L298_Enable(mLF, 0);
+            L298_Coast(mLS); L298_Enable(mLS, 0);
         } else {
             brake_ms = BRAKE_MS_BIG;
 
-            L298_SetDutyPercent(mA, 100); L298_Enable(mA, 1); L298_Brake(mA);
-            L298_SetDutyPercent(mB, 100); L298_Enable(mB, 1); L298_Brake(mB);
-            L298_SetDutyPercent(mL, 100); L298_Enable(mL, 1); L298_Brake(mL);
+            L298_SetDutyPercent(mA, 100);  L298_Enable(mA, 1);  L298_Brake(mA);
+            L298_SetDutyPercent(mB, 100);  L298_Enable(mB, 1);  L298_Brake(mB);
+            L298_SetDutyPercent(mLF,100);  L298_Enable(mLF,1);  L298_Brake(mLF);
+            L298_SetDutyPercent(mLS,100);  L298_Enable(mLS,1);  L298_Brake(mLS);
 
             uint32_t t0 = millis_ms();
             while ((millis_ms() - t0) < brake_ms) {
                 uint32_t t = millis_ms();
                 L298_Task(mA, t);
                 L298_Task(mB, t);
-                L298_Task(mL, t);
+                L298_Task(mLF,t);
+                L298_Task(mLS,t);
             }
 
-            L298_Coast(mA); L298_Enable(mA, 0);
-            L298_Coast(mB); L298_Enable(mB, 0);
-            L298_Coast(mL); L298_Enable(mL, 0);
+            L298_Coast(mA);  L298_Enable(mA,  0);
+            L298_Coast(mB);  L298_Enable(mB,  0);
+            L298_Coast(mLF); L298_Enable(mLF, 0);
+            L298_Coast(mLS); L298_Enable(mLS, 0);
         }
 
-        printf("DONE(SYNC 2+1): cA=%ld cB=%ld cL=%ld | dAB=%ld dL=%ld | outA=%u outB=%u outL=%u | brake=%ums\n",
-               (long)cA, (long)cB, (long)cL,
+        printf("DONE(SYNC 2+2, stop=progR): progR=%ld progL=%ld | cA=%ld cB=%ld cLF=%ld cLS=%ld | dAB=%ld dLL=%ld dLfol=%ld | brake=%ums\n",
+               (long)progR, (long)progL,
+               (long)cA, (long)cB, (long)cLF, (long)cLS,
                (long)(magA - magB),
-               (long)(magL - ((magA + magB) / 2)),
-               (unsigned)outA, (unsigned)outB, (unsigned)outL,
+               (long)(magLF - magLS),
+               (long)(progL - progR),
                (unsigned)brake_ms);
     }
 }
@@ -726,15 +810,19 @@ int main(void)
 
     usart2_init_tx_rx();
 
-    /* Encoder A: TIM3 PC6/PC7 (thư viện) */
+    /* Encoder A: TIM3 PC6/PC7 */
     EncoderEXTI_CQ_Init(&g_enc1);
 
     /* Encoder B: EXTI PC8/PC9 */
     encoderB_init_exti_pc8_pc9_pullup();
 
-    /* Encoder L: TIM1 PA8/PA9 */
-    encoderL_init_tim1_pa8_pa9_pullup();
-    encL_reset2();
+    /* Encoder LF: TIM1 PA8/PA9 */
+    encoderLF_init_tim1_pa8_pa9_pullup();
+    encLF_reset();
+
+    /* Encoder LS: EXTI PC10/PC11 */
+    encoderLS_init_exti_pc10_pc11_pullup();
+    encLS_reset();
 
     /* Motor A (M1): phải sau  EN=PD11, IN=PD13/PD14 */
     L298_Pins_t pins_mA = {
@@ -754,73 +842,85 @@ int main(void)
     L298_Handle_t motB;
     L298_Init(&motB, &pins_mB, PWM_PERIOD_MS);
 
-    /* Motor L (M3): trái trước ENB=PB12, IN3=PB13, IN4=PB14 */
-    L298_Pins_t pins_mL = {
+    /* Motor LF (M3): trái trước EN=PB12, IN=PB13, IN=PB14 */
+    L298_Pins_t pins_mLF = {
         .ENA_Port = GPIOB, .ENA_Pin = 12,
         .IN1_Port = GPIOB, .IN1_Pin = 13,
         .IN2_Port = GPIOB, .IN2_Pin = 14
     };
-    L298_Handle_t motL;
-    L298_Init(&motL, &pins_mL, PWM_PERIOD_MS);
+    L298_Handle_t motLF;
+    L298_Init(&motLF, &pins_mLF, PWM_PERIOD_MS);
+
+    /* Motor LS (M4): trái sau ENA=PB11, IN1=PB10, IN2=PE15 */
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOBEN | RCC_AHB1ENR_GPIOEEN;
+    (void)RCC->AHB1ENR;
+
+    L298_Pins_t pins_mLS = {
+        .ENA_Port = GPIOB, .ENA_Pin = 11,
+        .IN1_Port = GPIOB, .IN1_Pin = 10,
+        .IN2_Port = GPIOE, .IN2_Pin = 15
+    };
+    L298_Handle_t motLS;
+    L298_Init(&motLS, &pins_mLS, PWM_PERIOD_MS);
 
 #if AUTO_TEST_ENABLE
-    /* Auto test chạy cả 3 motor một lúc để kiểm tra dây/nguồn */
     if (AUTO_TEST_DIR_FWD) {
-        L298_SetDir(&motA, L298_DIR_FWD);
-        L298_SetDir(&motB, L298_DIR_FWD);
-        L298_SetDir(&motL, L298_DIR_FWD);
+        L298_SetDir(&motA,  L298_DIR_FWD);
+        L298_SetDir(&motB,  L298_DIR_FWD);
+        L298_SetDir(&motLF, L298_DIR_FWD);
+        L298_SetDir(&motLS, L298_DIR_FWD);
     } else {
-        L298_SetDir(&motA, L298_DIR_REV);
-        L298_SetDir(&motB, L298_DIR_REV);
-        L298_SetDir(&motL, L298_DIR_REV);
+        L298_SetDir(&motA,  L298_DIR_REV);
+        L298_SetDir(&motB,  L298_DIR_REV);
+        L298_SetDir(&motLF, L298_DIR_REV);
+        L298_SetDir(&motLS, L298_DIR_REV);
     }
 
-    L298_SetSpeed8(&motA, apply_calib_m1(AUTO_TEST_SPEED8));
-    L298_SetSpeed8(&motB, apply_calib_m2(AUTO_TEST_SPEED8));
-    L298_SetSpeed8(&motL, apply_calib_m3(AUTO_TEST_SPEED8));
+    L298_SetSpeed8(&motA,  apply_calib_m1(AUTO_TEST_SPEED8));
+    L298_SetSpeed8(&motB,  apply_calib_m2(AUTO_TEST_SPEED8));
+    L298_SetSpeed8(&motLF, apply_calib_m3(AUTO_TEST_SPEED8));
+    L298_SetSpeed8(&motLS, apply_calib_m4(AUTO_TEST_SPEED8));
 
-    L298_Enable(&motA, 1);
-    L298_Enable(&motB, 1);
-    L298_Enable(&motL, 1);
+    L298_Enable(&motA,  1);
+    L298_Enable(&motB,  1);
+    L298_Enable(&motLF, 1);
+    L298_Enable(&motLS, 1);
 
     uint32_t t0 = millis_ms();
     while ((millis_ms() - t0) < AUTO_TEST_MS) {
         uint32_t t = millis_ms();
         EncoderEXTI_CQ_Task(&g_enc1);
-        (void)encL_get_count2(); /* cập nhật tích lũy */
-        L298_Task(&motA, t);
-        L298_Task(&motB, t);
-        L298_Task(&motL, t);
+        (void)encLF_get_count();
+        L298_Task(&motA,  t);
+        L298_Task(&motB,  t);
+        L298_Task(&motLF, t);
+        L298_Task(&motLS, t);
     }
 
-    L298_Coast(&motA); L298_Enable(&motA, 0);
-    L298_Coast(&motB); L298_Enable(&motB, 0);
-    L298_Coast(&motL); L298_Enable(&motL, 0);
+    L298_Coast(&motA);  L298_Enable(&motA,  0);
+    L298_Coast(&motB);  L298_Enable(&motB,  0);
+    L298_Coast(&motLF); L298_Enable(&motLF, 0);
+    L298_Coast(&motLS); L298_Enable(&motLS, 0);
 #endif
 
     printf("START:\n");
-    printf("  A(M1) [PHAI SAU]  : EN=PD11 IN=PD13/PD14 | ENC_A: TIM3 PC6/PC7\n");
-    printf("  B(M2) [PHAI TRUOC]: EN=PD12 IN=PD9/PD10  | ENC_B: EXTI PC9/PC8\n");
-    printf("  L(M3) [TRAI TRUOC]: EN=PB12 IN=PB13/PB14 | ENC_L: TIM1 PA8/PA9\n");
+    printf("  A(M1)  [PHAI SAU] : EN=PD11 IN=PD13/PD14 | ENC_A : TIM3 PC6/PC7\n");
+    printf("  B(M2)  [PHAI TRUOC]:EN=PD12 IN=PD9/PD10  | ENC_B : EXTI PC9/PC8\n");
+    printf("  LF(M3) [TRAI TRUOC]:EN=PB12 IN=PB13/PB14 | ENC_LF: TIM1 PA8/PA9\n");
+    printf("  LS(M4) [TRAI SAU] : EN=PB11 IN1=PB10 IN2=PE15 | ENC_LS: EXTI PC11/PC10\n");
 
-    printf("CALIB:\n");
-    printf("  A: gain=%d%% bias=%d | B: gain=%d%% bias=%d | L: gain=%d%% bias=%d\n",
-           (int)M1_GAIN_PCT, (int)M1_BIAS_8BIT,
-           (int)M2_GAIN_PCT, (int)M2_BIAS_8BIT,
-           (int)M3_GAIN_PCT, (int)M3_BIAS_8BIT);
-
-    printf("SYNC_ENABLE=%d | DIV_AB=%d DIV_L=%d MAX_CORR=%d\n",
-           (int)SYNC_ENABLE, (int)SYNC_ERR_DIV_AB, (int)SYNC_ERR_DIV_L, (int)SYNC_MAX_CORR_8BIT);
+    printf("SYNC: stop theo progR=(|A|+|B|)/2 (HUONG B)\n");
 
     printf("CMD:\n");
-    printf("  <n>    : chay dong bo 3 banh n vong (am: nguoc)\n");
+    printf("  <n>    : chay dong bo 4 banh n vong (am: nguoc)\n");
     printf("  A<n>   : chi banh A\n");
     printf("  B<n>   : chi banh B\n");
-    printf("  L<n>   : chi banh L\n");
+    printf("  L<n>   : chi banh LF (trai truoc)\n");
+    printf("  S<n>   : chi banh LS (trai sau)\n");
     printf("  0      : stop\n");
-    printf("  RST    : reset 3 encoder\n");
+    printf("  RST    : reset 4 encoder\n");
 
-    Motion_t stA = {0}, stB = {0}, stL = {0};
+    Motion_t stA = {0}, stB = {0}, stLF = {0}, stLS = {0};
     uint32_t last_print = millis_ms();
     char line[CMD_BUF_SZ];
 
@@ -835,11 +935,12 @@ int main(void)
         }
 
         EncoderEXTI_CQ_Task(&g_enc1);
-        (void)encL_get_count2();
+        (void)encLF_get_count();
 
-        L298_Task(&motA, now);
-        L298_Task(&motB, now);
-        L298_Task(&motL, now);
+        L298_Task(&motA,  now);
+        L298_Task(&motB,  now);
+        L298_Task(&motLF, now);
+        L298_Task(&motLS, now);
 
         if (cmd_poll_line(line, sizeof(line)))
         {
@@ -847,20 +948,23 @@ int main(void)
             {
                 encA_reset();
                 encB_reset();
-                encL_reset2();
+                encLF_reset();
+                encLS_reset();
 
-                motion_stop(&motA, &stA);
-                motion_stop(&motB, &stB);
-                motion_stop(&motL, &stL);
+                motion_stop(&motA,  &stA);
+                motion_stop(&motB,  &stB);
+                motion_stop(&motLF, &stLF);
+                motion_stop(&motLS, &stLS);
 
                 g_sync_all = 0;
-                printf("OK: reset encA+encB+encL, stop all\n");
+                printf("OK: reset encA+encB+encLF+encLS, stop all\n");
             }
             else if (strcmp(line, "0") == 0)
             {
-                motion_stop(&motA, &stA);
-                motion_stop(&motB, &stB);
-                motion_stop(&motL, &stL);
+                motion_stop(&motA,  &stA);
+                motion_stop(&motB,  &stB);
+                motion_stop(&motLF, &stLF);
+                motion_stop(&motLS, &stLS);
                 g_sync_all = 0;
                 printf("STOP ALL\n");
             }
@@ -869,8 +973,9 @@ int main(void)
                 long rev_cmd = strtol(line + 1, NULL, 10);
                 g_sync_all = 0;
                 motion_start_single(&motA, &stA, rev_cmd, now, encA_reset, 1);
-                motion_stop(&motB, &stB);
-                motion_stop(&motL, &stL);
+                motion_stop(&motB,  &stB);
+                motion_stop(&motLF, &stLF);
+                motion_stop(&motLS, &stLS);
                 printf("GO(A): %ld\n", rev_cmd);
             }
             else if (line[0] == 'B' || line[0] == 'b')
@@ -878,55 +983,75 @@ int main(void)
                 long rev_cmd = strtol(line + 1, NULL, 10);
                 g_sync_all = 0;
                 motion_start_single(&motB, &stB, rev_cmd, now, encB_reset, 2);
-                motion_stop(&motA, &stA);
-                motion_stop(&motL, &stL);
+                motion_stop(&motA,  &stA);
+                motion_stop(&motLF, &stLF);
+                motion_stop(&motLS, &stLS);
                 printf("GO(B): %ld\n", rev_cmd);
             }
             else if (line[0] == 'L' || line[0] == 'l')
             {
                 long rev_cmd = strtol(line + 1, NULL, 10);
                 g_sync_all = 0;
-                motion_start_single(&motL, &stL, rev_cmd, now, encL_reset2, 3);
-                motion_stop(&motA, &stA);
-                motion_stop(&motB, &stB);
-                printf("GO(L): %ld\n", rev_cmd);
+                motion_start_single(&motLF, &stLF, rev_cmd, now, encLF_reset, 3);
+                motion_stop(&motA,  &stA);
+                motion_stop(&motB,  &stB);
+                motion_stop(&motLS, &stLS);
+                printf("GO(LF): %ld\n", rev_cmd);
+            }
+            else if (line[0] == 'S' || line[0] == 's')
+            {
+                long rev_cmd = strtol(line + 1, NULL, 10);
+                g_sync_all = 0;
+                motion_start_single(&motLS, &stLS, rev_cmd, now, encLS_reset, 4);
+                motion_stop(&motA,  &stA);
+                motion_stop(&motB,  &stB);
+                motion_stop(&motLF, &stLF);
+                printf("GO(LS): %ld\n", rev_cmd);
             }
             else
             {
                 long rev_cmd = strtol(line, NULL, 10);
-                start_all(&motA, &motB, &motL, &stA, &stB, &stL, rev_cmd, now);
-                printf("GO(ALL SYNC 2+1): %ld\n", rev_cmd);
+                start_all(&motA, &motB, &motLF, &motLS, &stA, &stB, &stLF, &stLS, rev_cmd, now);
+                printf("GO(ALL SYNC 2+2, stop=progR): %ld\n", rev_cmd);
             }
         }
 
         if (g_sync_all) {
-            sync_update_all(&motA, &motB, &motL, &stA, &stB, &stL, now);
+            sync_update_all(&motA, &motB, &motLF, &motLS, &stA, &stB, &stLF, &stLS, now);
         } else {
-            motion_update_single(&motA, &stA, now, encA_get_count, "A", 1);
-            motion_update_single(&motB, &stB, now, encB_get_count, "B", 2);
-            motion_update_single(&motL, &stL, now, encL_get_count2, "L", 3);
+            motion_update_single(&motA,  &stA,  now, encA_get_count,  "A",  1);
+            motion_update_single(&motB,  &stB,  now, encB_get_count,  "B",  2);
+            motion_update_single(&motLF, &stLF, now, encLF_get_count, "LF", 3);
+            motion_update_single(&motLS, &stLS, now, encLS_get_count, "LS", 4);
         }
 
         if ((now - last_print) >= PRINT_PERIOD_MS)
         {
             last_print = now;
 
-            int32_t cA = encA_get_count();
-            int32_t cB = encB_get_count();
-            int32_t cL = encL_get_count2();
+            int32_t cA  = encA_get_count();
+            int32_t cB  = encB_get_count();
+            int32_t cLF = encLF_get_count();
+            int32_t cLS = encLS_get_count();
 
-            int32_t magA = iabs32(cA);
-            int32_t magB = iabs32(cB);
-            int32_t magL = iabs32(cL);
+            int32_t magA  = iabs32(cA);
+            int32_t magB  = iabs32(cB);
+            int32_t magLF = iabs32(cLF);
+            int32_t magLS = iabs32(cLS);
+
             int32_t progR = (magA + magB) / 2;
+            int32_t progL = (magLF + magLS) / 2;
 
-            printf("sync=%u | runA=%u cA=%ld | runB=%u cB=%ld | runL=%u cL=%ld | dAB=%ld dL=%ld\n",
+            printf("sync=%u | runA=%u cA=%ld | runB=%u cB=%ld | runLF=%u cLF=%ld | runLS=%u cLS=%ld | progR=%ld progL=%ld | dAB=%ld dLL=%ld dLfol=%ld\n",
                    (unsigned)g_sync_all,
-                   (unsigned)stA.running, (long)cA,
-                   (unsigned)stB.running, (long)cB,
-                   (unsigned)stL.running, (long)cL,
+                   (unsigned)stA.running,  (long)cA,
+                   (unsigned)stB.running,  (long)cB,
+                   (unsigned)stLF.running, (long)cLF,
+                   (unsigned)stLS.running, (long)cLS,
+                   (long)progR, (long)progL,
                    (long)(magA - magB),
-                   (long)(magL - progR));
+                   (long)(magLF - magLS),
+                   (long)(progL - progR));
         }
     }
 }
